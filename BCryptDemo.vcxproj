@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{CFC399DF-56AF-4DCE-AD31-9876D1D01234}</ProjectGuid>
+    <RootNamespace>BCryptDemo</RootNamespace>
+  </PropertyGroup>
+
+  <Import Project="$(MSBuildProjectDirectory)\common.props" />
+
+  <ItemGroup>
+    <ClCompile Include="BCryptDemo.cpp" />
+  </ItemGroup>
+
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalDependencies>Bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+</Project>

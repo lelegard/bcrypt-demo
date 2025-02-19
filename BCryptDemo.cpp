@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <psapi.h>
 
+// All data buffers are vectors of bytes.
 using ByteVector = std::vector<uint8_t>;
 
 
@@ -65,28 +66,6 @@ private:
 
 
 //----------------------------------------------------------------------------
-// A class to measure CPU time.
-//----------------------------------------------------------------------------
-
-class CpuTime
-{
-public:
-    // Constructor. Initialize the time.
-    CpuTime() : _start(cpu_time()) {}
-
-    // Reset the start time, restart measurement.
-    void reset() { _start = cpu_time(); }
-
-    // Number of microseconds of CPU time since constructor or reset().
-    int64_t usec() const { return cpu_time() - _start; }
-
-private:
-    int64_t _start = 0;
-    static int64_t cpu_time();
-};
-
-
-//----------------------------------------------------------------------------
 // Wrapper for a BCrypt algorithm.
 // The destructor enforces the clean termination of resources.
 //----------------------------------------------------------------------------
@@ -112,6 +91,9 @@ public:
     // Get the initialization vector size for the chaining mode.
     size_t iv_size() const { return _iv_size; }
 
+    // Get the maximum authentication tag size, if the chaining mode is authenticating (CCM, GCM).
+    size_t max_auth_tag_size() const { return _max_auth_tag_size; }
+
     // Free the algo resources, silently or with log.
     void close();
     bool close(Log& log);
@@ -122,6 +104,7 @@ public:
 private:
     BCRYPT_ALG_HANDLE _handle = nullptr;
     size_t _iv_size = 0;
+    size_t _max_auth_tag_size = 0;
 };
 
 
@@ -130,7 +113,7 @@ private:
 // The destructor enforces the clean termination of resources.
 //----------------------------------------------------------------------------
 
-class Key
+class SymmetricKey
 {
 public:
     // Load a key value.
@@ -143,45 +126,94 @@ public:
     bool set_iv(Log& log, const ByteVector& iv);
 
     // Encrypt a chunk of data. Plain size must be a multiple of block size, unless pad_final is true.
-    bool encrypt(Log& log, const ByteVector& plain, ByteVector& cipher, bool pad_final = false);
+    // Encrypted data are _appended_ at the end of the byte vector (suitable for segmented encryption).
+    bool encrypt(Log& log, const void* plain, size_t plain_size, ByteVector& cipher, bool pad_final = false);
+    bool encrypt(Log& log, const ByteVector& plain, ByteVector& cipher, bool pad_final = false)
+    {
+        return encrypt(log, plain.data(), plain.size(), cipher, pad_final);
+    }
 
     // Decrypt a chunk of data. Cipher size must be a multiple of block size.
+    // Decrypted data are _appended_ at the end of the byte vector (suitable for segmented decryption).
     // Pad_final must be set exactly if it was used during production of the last cipher block.
-    bool decrypt(Log& log, const ByteVector& cipher, ByteVector& plain, bool pad_final = false);
+    bool decrypt(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain, bool pad_final = false);
+    bool decrypt(Log& log, const ByteVector& cipher, ByteVector& plain, bool pad_final = false)
+    {
+        return decrypt(log, cipher.data(), cipher.size(), plain, pad_final);
+    }
 
     // Free the key resources, silently or with log.
     void close();
     bool close(Log& log);
 
     // Destructor.
-    ~Key();
+    ~SymmetricKey();
 
-private:
+protected:
     BCRYPT_KEY_HANDLE _handle = nullptr;
     size_t _block_size = 0;
     size_t _iv_size = 0;
+    size_t _max_auth_tag_size = 0;
     ByteVector _iv {};
     ByteVector _key_object {};
 };
 
 
 //----------------------------------------------------------------------------
-// CpuTime implementation: A class to measure CPU time.
+// Wrapper for a BCrypt symmetric key in GCM mode.
+// The destructor enforces the clean termination of resources.
 //----------------------------------------------------------------------------
 
-// Get current CPU time resource usage in microseconds in current process.
-int64_t CpuTime::cpu_time()
+class GCM : public SymmetricKey
 {
-    FILETIME creation_time, exit_time, kernel_time, user_time;
-    if (GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time, &kernel_time, &user_time) == 0) {
-        std::cerr << "GetProcessTimes error 0x" << std::hex << GetLastError() << std::endl;
-        std::exit(EXIT_FAILURE);
+public:
+    // Set the initialization vector for the next chain of operations.
+    // The IV size must be GCM_IV_SIZE on Windows.
+    // The additional authentication data (aad) are optional.
+    // Must be called before a chain of encrypt or decrypt.
+    bool set_iv(Log& log, const ByteVector& iv, const ByteVector& aad = ByteVector());
+
+    // Encrypt a chunk of data. The plain data size must be a multiple of the block size.
+    // Encrypted data are _appended_ at the end of the byte vector (suitable for segmented encryption).
+    bool encrypt(Log& log, const void* plain, size_t plain_size, ByteVector& cipher);
+    bool encrypt(Log& log, const ByteVector& plain, ByteVector& cipher)
+    {
+        return encrypt(log, plain.data(), plain.size(), cipher);
     }
-    // A FILETIME is a 64-bit value in 100-nanosecond units (10 microseconds).
-    const int64_t ktime = (int64_t(kernel_time.dwHighDateTime) << 32) | kernel_time.dwLowDateTime;
-    const int64_t utime = (int64_t(user_time.dwHighDateTime) << 32) | user_time.dwLowDateTime;
-    return (ktime + utime) / 10;
-}
+
+    // Terminate a chain of encrypt() and get the authentication.
+    // Encrypt the last chunk of data. Plain data can be of any size.
+    // Encrypted data are _appended_ at the end of the byte vector.
+    bool encrypt_final(Log& log, const void* plain, size_t plain_size, ByteVector& cipher, ByteVector& tag);
+    bool encrypt_final(Log& log, const ByteVector& plain, ByteVector& cipher, ByteVector& tag)
+    {
+        return encrypt_final(log, plain.data(), plain.size(), cipher, tag);
+    }
+
+    // Decrypt a chunk of data. The cipher data size must be a multiple of the block size.
+    // Decrypted data are _appended_ at the end of the byte vector (suitable for segmented decryption).
+    bool decrypt(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain);
+    bool decrypt(Log& log, const ByteVector& cipher, ByteVector& plain)
+    {
+        return decrypt(log, cipher.data(), cipher.size(), plain);
+    }
+
+    // Terminate a chain of decrypt() and verify authentication tag from an expected value.
+    // Decrypt the last chunk of data. Cipher data can be of any size.
+    // Decrypted data are _appended_ at the end of the byte vector.
+    bool decrypt_final(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain, const ByteVector& tag);
+    bool decrypt_final(Log& log, const ByteVector& cipher, ByteVector& plain, const ByteVector& tag)
+    {
+        return decrypt_final(log, cipher.data(), cipher.size(), plain, tag);
+    }
+
+private:
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO _auth_info {};
+    ByteVector _nonce {};        // initial IV (_iv is the intermediate IV buffer).
+    ByteVector _aad {};          // input additional authentication data
+    ByteVector _auth_tag {};     // authentication tag (encrypt: output, decrypt: input)
+    ByteVector _mac_context {};  // work data for BCrypt
+};
 
 
 //----------------------------------------------------------------------------
@@ -286,7 +318,7 @@ bool pbkdf2(Log& log, ByteVector& derived_key, LPCWSTR hash_algo, const std::str
 
 
 //----------------------------------------------------------------------------
-// AlgoWrapper implementation: Wrapper for a BCrypt algorithm.
+// Algorithm implementation: Wrapper for a BCrypt algorithm.
 //----------------------------------------------------------------------------
 
 // Open an algorithm with an optional chaining mode.
@@ -305,13 +337,28 @@ bool Algorithm::open(Log& log, LPCWSTR algo_name, LPCWSTR chain_mode)
     if (chain_mode != nullptr) {
         status = BCryptSetProperty(_handle, BCRYPT_CHAINING_MODE, PUCHAR(chain_mode), sizeof(chain_mode), 0);
         if (!log.bcrypt(status, "BCryptSetProperty(BCRYPT_CHAINING_MODE)")) {
+            close();
             return false;
         }
         // Get the expected IV size. There is no property for that, we need to check known modes.
-        if (equal(chain_mode, BCRYPT_CHAIN_MODE_CBC)) {
+        if (equal(chain_mode, BCRYPT_CHAIN_MODE_CBC) ||
+            equal(chain_mode, BCRYPT_CHAIN_MODE_CCM) ||
+            equal(chain_mode, BCRYPT_CHAIN_MODE_CFB) ||
+            equal(chain_mode, BCRYPT_CHAIN_MODE_GCM))
+        {
             _iv_size = block_size(log);
         }
-        // TODO: BCRYPT_CHAIN_MODE_CCM, BCRYPT_CHAIN_MODE_CFB, BCRYPT_CHAIN_MODE_GCM
+        // Get the maximum authentication tag size, if the chaining mode is authenticating.
+        if (equal(chain_mode, BCRYPT_CHAIN_MODE_CCM) ||
+            equal(chain_mode, BCRYPT_CHAIN_MODE_GCM))
+        {
+            DWORD retsize = 0;
+            BCRYPT_AUTH_TAG_LENGTHS_STRUCT tags {0, 0, 0};
+            status = BCryptGetProperty(_handle, BCRYPT_AUTH_TAG_LENGTH, PUCHAR(&tags), sizeof(tags), &retsize, 0);
+            if (log.bcrypt(status, "BCryptGetProperty(BCRYPT_AUTH_TAG_LENGTH)")) {
+                _max_auth_tag_size = size_t(tags.dwMaxLength);
+            }
+        }
     }
     return true;
 }
@@ -349,8 +396,8 @@ bool Algorithm::close(Log& log)
     else {
         NTSTATUS status = BCryptCloseAlgorithmProvider(_handle, 0);
         _handle = nullptr;
-        _iv_size = 0;
-        return log.bcrypt(status, "BCryptCloseAlgorithmProvider");        
+        _iv_size = _max_auth_tag_size = 0;
+        return log.bcrypt(status, "BCryptCloseAlgorithmProvider");
     }
 }
 
@@ -360,7 +407,7 @@ void Algorithm::close()
     if (_handle != nullptr) {
         BCryptCloseAlgorithmProvider(_handle, 0);
         _handle = nullptr;
-        _iv_size = 0;
+        _iv_size = _max_auth_tag_size = 0;
     }
 }
 
@@ -372,17 +419,18 @@ Algorithm::~Algorithm()
 
 
 //----------------------------------------------------------------------------
-// KeyWrapper implementation: Wrapper for a BCrypt symmetric key.
+// SymmetricKey implementation: Wrapper for a BCrypt symmetric key.
 //----------------------------------------------------------------------------
 
 // Load a key value.
-bool Key::load(Log& log, Algorithm& algo, const ByteVector& key)
+bool SymmetricKey::load(Log& log, Algorithm& algo, const ByteVector& key)
 {
     // Close previous key handle.
     close();
 
     _block_size = algo.block_size(log);
     _iv_size = algo.iv_size();
+    _max_auth_tag_size = algo.max_auth_tag_size();
     _iv.clear();
 
     // Get the size of the "key object" for that algo.
@@ -409,7 +457,7 @@ bool Key::load(Log& log, Algorithm& algo, const ByteVector& key)
 }
 
 // Set the initialization vector for the next chain of operations.
-bool Key::set_iv(Log& log, const ByteVector& iv)
+bool SymmetricKey::set_iv(Log& log, const ByteVector& iv)
 {
     if (iv.size() == _iv_size) {
         _iv = iv;
@@ -422,42 +470,50 @@ bool Key::set_iv(Log& log, const ByteVector& iv)
 }
 
 // Encrypt a chunk of data. Plain size must be a multiple of block size, unless pad_final is true.
-bool Key::encrypt(Log& log, const ByteVector& plain, ByteVector& cipher, bool pad_final)
+bool SymmetricKey::encrypt(Log& log, const void* plain, size_t plain_size, ByteVector& cipher, bool pad_final)
 {
-    if (!pad_final && _block_size != 0 && plain.size() % _block_size != 0) {
+    if (!pad_final && _block_size != 0 && plain_size % _block_size != 0) {
         log.debug("encrypt: plain size is not a multiple of the block size");
     }
 
-    cipher.resize(plain.size() + _block_size);
+    // Enlarge output buffer to receive encrypted data.
+    // In case of padding, the output size is up to one additional block.
+    const size_t previous_size = cipher.size();
+    cipher.resize(previous_size + plain_size + _block_size);
+
     ULONG retsize = 0;
-    NTSTATUS status = BCryptEncrypt(_handle, PUCHAR(plain.data()), ULONG(plain.size()), nullptr,
+    NTSTATUS status = BCryptEncrypt(_handle, PUCHAR(plain), ULONG(plain_size), nullptr,
                                     _iv.empty() ? nullptr : PUCHAR(_iv.data()), ULONG(_iv.size()),
-                                    PUCHAR(cipher.data()), ULONG(cipher.size()), &retsize,
+                                    PUCHAR(cipher.data() + previous_size), ULONG(cipher.size() - previous_size), &retsize,
                                     pad_final ? BCRYPT_BLOCK_PADDING : 0);
-    cipher.resize(std::min<size_t>(cipher.size(), retsize));
+    cipher.resize(std::min<size_t>(cipher.size(), previous_size + retsize));
     return log.bcrypt(status, "BCryptEncrypt");
 }
 
 // Decrypt a chunk of data. Cipher size must be a multiple of block size.
 // Pad_final must be set exactly if it was used during production of the last cipher block.
-bool Key::decrypt(Log& log, const ByteVector& cipher, ByteVector& plain, bool pad_final)
+bool SymmetricKey::decrypt(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain, bool pad_final)
 {
-    if (_block_size != 0 && cipher.size() % _block_size != 0) {
+    if (_block_size != 0 && cipher_size % _block_size != 0) {
         log.debug("decrypt: cipher size is not a multiple of the block size");
     }
 
-    plain.resize(cipher.size());
+    // Enlarge output buffer to receive decrypted data (never larger than cipher text).
+    // In case of padding, the output size is up to one additional block.
+    const size_t previous_size = plain.size();
+    plain.resize(previous_size + cipher_size);
+
     ULONG retsize = 0;
-    NTSTATUS status = BCryptDecrypt(_handle, PUCHAR(cipher.data()), ULONG(cipher.size()), nullptr,
+    NTSTATUS status = BCryptDecrypt(_handle, PUCHAR(cipher), ULONG(cipher_size), nullptr,
                                     _iv.empty() ? nullptr : PUCHAR(_iv.data()), ULONG(_iv.size()),
-                                    PUCHAR(plain.data()), ULONG(plain.size()), &retsize,
+                                    PUCHAR(plain.data() + previous_size), ULONG(plain.size() - previous_size), &retsize,
                                     pad_final ? BCRYPT_BLOCK_PADDING : 0);
-    plain.resize(std::min<size_t>(plain.size(), retsize));
+    plain.resize(std::min<size_t>(plain.size(), previous_size + retsize));
     return log.bcrypt(status, "BCryptDecrypt");
 }
 
 // Free the key resources.
-bool Key::close(Log& log)
+bool SymmetricKey::close(Log& log)
 {
     if (_handle == nullptr) {
         return true;
@@ -466,12 +522,12 @@ bool Key::close(Log& log)
         NTSTATUS status = BCryptDestroyKey(_handle);
         _handle = nullptr;
         _key_object.clear();
-        return log.bcrypt(status, "BCryptDestroyKey");        
+        return log.bcrypt(status, "BCryptDestroyKey");
     }
 }
 
 // Silently free the key resources.
-void Key::close()
+void SymmetricKey::close()
 {
     if (_handle != nullptr) {
         BCryptDestroyKey(_handle);
@@ -480,140 +536,117 @@ void Key::close()
 }
 
 // Destructor.
-Key::~Key()
+SymmetricKey::~SymmetricKey()
 {
     close();
 }
 
 
+//----------------------------------------------------------------------------
+// GCM implementation: Wrapper for a BCrypt symmetric key in GCM mode.
+//----------------------------------------------------------------------------
 
-#if 0
-
-void one_test_gcm(const char* algo_name, size_t key_bits)
+// Set the initialization vector for the next chain of operations.
+bool GCM::set_iv(Log& log, const ByteVector& iv, const ByteVector& aad)
 {
-    // Open algorithm provider (AES).
-    BCRYPT_ALG_HANDLE algo = nullptr;
-    check("BCryptOpenAlgorithmProvider",
-        BCryptOpenAlgorithmProvider(&algo, BCRYPT_AES_ALGORITHM, nullptr, 0));
+    _nonce = iv;
+    _aad = aad;
+    _iv.resize(_block_size);
+    _auth_tag.resize(_max_auth_tag_size);
+    _mac_context.resize(_max_auth_tag_size);
 
-    // Set chaining mode.
-    const LPCWSTR chain_mode = BCRYPT_CHAIN_MODE_GCM;
-    check("BCryptSetProperty(BCRYPT_CHAINING_MODE)",
-        BCryptSetProperty(algo, BCRYPT_CHAINING_MODE, PUCHAR(chain_mode), sizeof(chain_mode), 0));
+    BCRYPT_INIT_AUTH_MODE_INFO(_auth_info);
+    _auth_info.pbNonce      = PUCHAR(_nonce.data());
+    _auth_info.cbNonce      = ULONG(_nonce.size());
+    _auth_info.pbAuthData   = _aad.empty() ? nullptr : PUCHAR(_aad.data());
+    _auth_info.cbAuthData   = ULONG(_aad.size());
+    _auth_info.pbTag        = PUCHAR(_auth_tag.data());
+    _auth_info.cbTag        = ULONG(_auth_tag.size());
+    _auth_info.pbMacContext = PUCHAR(_mac_context.data());
+    _auth_info.cbMacContext = ULONG(_mac_context.size());
 
-    // Get the size of the "key object" for that algo.
-    DWORD objlength = 0;
-    ULONG retsize = 0;
-    check("BCryptGetProperty(BCRYPT_OBJECT_LENGTH)",
-        BCryptGetProperty(algo, BCRYPT_OBJECT_LENGTH, PUCHAR(&objlength), sizeof(objlength), &retsize, 0));
-
-    // Get the block size. Just a test, should be AES block size.
-    DWORD block_size = 0;
-    check("BCryptGetProperty(BCRYPT_BLOCK_LENGTH)",
-        BCryptGetProperty(algo, BCRYPT_BLOCK_LENGTH, PUCHAR(&block_size), sizeof(block_size), &retsize, 0));
-
-    // Get the authentication tag length.
-    BCRYPT_AUTH_TAG_LENGTHS_STRUCT tags {0, 0, 0};
-    check("BCryptGetProperty(BCRYPT_AUTH_TAG_LENGTH)",
-        BCryptGetProperty(algo, BCRYPT_AUTH_TAG_LENGTH, PUCHAR(&tags), sizeof(tags), &retsize, 0));
-
-    ByteVector key(key_bits / 8, 0);
-    ByteVector key_object(objlength, 0);
-    ByteVector iv(block_size, 0x47);
-    ByteVector nonce(GCM_NONCE_SIZE, 0xA4);
-    ByteVector auth_tag(tags.dwMinLength, 0x6D);
-    ByteVector input(BLOCK_COUNT * block_size, 0xA5);
-    ByteVector output(input.size() + block_size, 0);
-
-    // Enforce different bytes in key.
-    uint8_t byte = 0x23;
-    for (auto& kbyte : key) {
-        kbyte = byte++;
-    }
-
-    // Build a key data blob (header, followed by key).
-    ByteVector key_data(sizeof(BCRYPT_KEY_DATA_BLOB_HEADER) + key.size());
-    BCRYPT_KEY_DATA_BLOB_HEADER* header = reinterpret_cast<BCRYPT_KEY_DATA_BLOB_HEADER*>(key_data.data());
-    header->dwMagic = BCRYPT_KEY_DATA_BLOB_MAGIC;
-    header->dwVersion = BCRYPT_KEY_DATA_BLOB_VERSION1;
-    header->cbKeyData = ULONG(key.size());
-    memcpy(key_data.data() + sizeof(BCRYPT_KEY_DATA_BLOB_HEADER), key.data(), key.size());
-
-    // Create a new key handle.
-    BCRYPT_KEY_HANDLE hkey = nullptr;
-    check("BCryptImportKey",
-        BCryptImportKey(algo, nullptr, BCRYPT_KEY_DATA_BLOB, &hkey,
-            key_object.data(), ULONG(key_object.size()),
-            PUCHAR(key_data.data()), ULONG(key_data.size()), 0));
-
-    // GCM authentication info.
-    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth_info;
-    BCRYPT_INIT_AUTH_MODE_INFO(auth_info);
-    ByteVector mac_context(tags.dwMaxLength, 0);
-    auth_info.pbNonce = PUCHAR(nonce.data());
-    auth_info.cbNonce = ULONG(nonce.size());
-    auth_info.pbTag   = PUCHAR(auth_tag.data());
-    auth_info.cbTag   = ULONG(auth_tag.size());
-    auth_info.pbMacContext = PUCHAR(mac_context.data());
-    auth_info.cbMacContext = ULONG(mac_context.size());
-
-    std::cout << "algo: " << algo_name << std::endl;
-    std::cout << "key-size: " << key.size() << std::endl;
-    std::cout << "iv-size: " << iv.size() << std::endl;
-    std::cout << "block-size: " << block_size << std::endl;
-    std::cout << "data-size: " << input.size() << std::endl;
-    std::cout << "auth-tag-size: min: " << tags.dwMinLength << ", max: " << tags.dwMaxLength << ", incr: " << tags.dwIncrement << std::endl;
-
-    int output_len = 0;
-    uint64_t start = 0;
-    uint64_t duration = 0;
-    uint64_t size = 0;
-
-    // Encryption test.
-    size = 0;
-    start = cpu_time_usec();
-    do {
-        auth_info.dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
-        for (size_t i = 0; i < INNER_LOOP_COUNT; i++) {
-            check("BCryptEncrypt",
-                BCryptEncrypt(hkey, PUCHAR(input.data()), ULONG(input.size()), &auth_info,
-                    PUCHAR(iv.data()), ULONG(iv.size()),
-                    PUCHAR(output.data()), ULONG(output.size()),
-                    &retsize, 0));
-            size += input.size();
-        }
-        duration = cpu_time_usec() - start;
-    } while (duration < MIN_CPU_TIME);
-    // Ignore last block, check performance only.
-    std::cout << "encrypt-microsec: " << duration << std::endl;
-    std::cout << "encrypt-size: " << size << std::endl;
-    std::cout << "encrypt-bitrate: " << ((USECPERSEC * 8 * size) / duration) << std::endl;
-
-    // Decryption test.
-    size = 0;
-    start = cpu_time_usec();
-    do {
-        auth_info.dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
-        for (size_t i = 0; i < INNER_LOOP_COUNT; i++) {
-            check("BCryptDecrypt",
-                BCryptDecrypt(hkey, PUCHAR(input.data()), ULONG(input.size()), &auth_info,
-                    PUCHAR(iv.data()), ULONG(iv.size()),
-                    PUCHAR(output.data()), ULONG(output.size()),
-                    &retsize, 0));
-            size += input.size();
-        }
-        duration = cpu_time_usec() - start;
-    } while (duration < MIN_CPU_TIME);
-    // Ignore last block, check performance only.
-    std::cout << "decrypt-microsec: " << duration << std::endl;
-    std::cout << "decrypt-size: " << size << std::endl;
-    std::cout << "decrypt-bitrate: " << ((USECPERSEC * 8 * size) / duration) << std::endl;
-
-    check("BCryptDestroyKey", BCryptDestroyKey(hkey));
-    check("BCryptCloseAlgorithmProvider", BCryptCloseAlgorithmProvider(algo, 0));
+    return true;
 }
 
-#endif
+// Encrypt a chunk of data. Plain data can be of any size (unrelated to algorithm block size).
+bool GCM::encrypt(Log& log, const void* plain, size_t plain_size, ByteVector& cipher)
+{
+    // Enlarge output buffer to receive encrypted data.
+    const size_t previous_size = cipher.size();
+    cipher.resize(previous_size + plain_size);
+
+    _auth_info.dwFlags |= BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+    ULONG retsize = 0;
+    NTSTATUS status = BCryptEncrypt(_handle, PUCHAR(plain), ULONG(plain_size), &_auth_info,
+                                    PUCHAR(_iv.data()), ULONG(_iv.size()),
+                                    PUCHAR(cipher.data() + previous_size), ULONG(cipher.size() - previous_size),
+                                    &retsize, 0);
+    cipher.resize(std::min<size_t>(cipher.size(), previous_size + retsize));
+    return log.bcrypt(status, "BCryptEncrypt(GCM)");
+}
+
+// Terminate a chain of encrypt() and get the authentication.
+bool GCM::encrypt_final(Log& log, const void* plain, size_t plain_size, ByteVector& cipher, ByteVector& tag)
+{
+    // Enlarge output buffer to receive encrypted data.
+    const size_t previous_size = cipher.size();
+    cipher.resize(previous_size + plain_size);
+
+    _auth_info.dwFlags &= ~BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+    ULONG retsize = 0;
+    NTSTATUS status = BCryptEncrypt(_handle, PUCHAR(plain), ULONG(plain_size), &_auth_info,
+                                    PUCHAR(_iv.data()), ULONG(_iv.size()),
+                                    PUCHAR(cipher.data() + previous_size), ULONG(cipher.size() - previous_size),
+                                    &retsize, 0);
+    cipher.resize(std::min<size_t>(cipher.size(), previous_size + retsize));
+    if (!log.bcrypt(status, "BCryptEncrypt(GCM-final)")) {
+        tag.clear();
+        return false;
+    }
+    else {
+        tag.resize(_auth_info.cbTag);
+        memcpy(tag.data(), _auth_info.pbTag, _auth_info.cbTag);
+        return true;
+    }
+}
+
+// Decrypt a chunk of data (any size).
+bool GCM::decrypt(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain)
+{
+    // Enlarge output buffer to receive decrypted data.
+    const size_t previous_size = plain.size();
+    plain.resize(previous_size + cipher_size);
+
+    _auth_info.dwFlags |= BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+    ULONG retsize = 0;
+    NTSTATUS status = BCryptDecrypt(_handle, PUCHAR(cipher), ULONG(cipher_size), &_auth_info,
+                                    PUCHAR(_iv.data()), ULONG(_iv.size()),
+                                    PUCHAR(plain.data() + previous_size), ULONG(plain.size() - previous_size),
+                                    &retsize, 0);
+    plain.resize(std::min<size_t>(plain.size(), previous_size + retsize));
+    return log.bcrypt(status, "BCryptDecrypt(GCM)");
+}
+
+// Terminate a chain of decrypt() and verify authentication tag from an expected value.
+bool GCM::decrypt_final(Log& log, const void* cipher, size_t cipher_size, ByteVector& plain, const ByteVector& tag)
+{
+    // Enlarge output buffer to receive decrypted data.
+    const size_t previous_size = plain.size();
+    plain.resize(previous_size + cipher_size);
+
+    _auth_info.dwFlags &= ~BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
+    _auth_info.pbTag = PUCHAR(tag.data());
+    _auth_info.cbTag = ULONG(tag.size());
+
+    ULONG retsize = 0;
+    NTSTATUS status = BCryptDecrypt(_handle, PUCHAR(cipher), ULONG(cipher_size), &_auth_info,
+                                    PUCHAR(_iv.data()), ULONG(_iv.size()),
+                                    PUCHAR(plain.data() + previous_size), ULONG(plain.size() - previous_size),
+                                    &retsize, 0);
+    plain.resize(std::min<size_t>(plain.size(), previous_size + retsize));
+    return log.bcrypt(status, "BCryptDecrypt(GCM-final)");
+}
+
 
 //----------------------------------------------------------------------------
 // Run test vectors for PBKDF2
@@ -704,6 +737,7 @@ void test_ecb_cbc(Log& log)
     };
 
     // Test vectors were generated using openssl command lines and data from /dev/random.
+    // If plain is not a multiple of the block size, use final padding.
     static const std::vector<test_vector> tests{
         {
             BCRYPT_AES_ALGORITHM, BCRYPT_CHAIN_MODE_ECB,
@@ -759,30 +793,217 @@ void test_ecb_cbc(Log& log)
              0x03, 0x51, 0xE7, 0x96, 0xA7, 0xF2, 0x6A, 0x32, 0x61, 0x7C, 0xF8, 0x03, 0x80, 0x2F, 0x4D, 0x12,
              0x5F, 0x2D, 0xE8, 0x03, 0x71, 0x10, 0x9A, 0xC7, 0x51, 0x38, 0x18, 0x5B, 0xC6, 0x14, 0x12, 0xD6},
         },
+        {
+            BCRYPT_AES_ALGORITHM, BCRYPT_CHAIN_MODE_CBC,
+            {0xD7, 0x95, 0xC1, 0xA5, 0x75, 0x0B, 0x57, 0xD7, 0xDA, 0xAC, 0x2A, 0x8F, 0xC5, 0xF1, 0x1A, 0xA6},
+            {0xCB, 0xE9, 0xDF, 0x8D, 0x2D, 0xC7, 0xEC, 0xE7, 0x37, 0x66, 0xD8, 0x76, 0x95, 0x86, 0x7C, 0xC8},
+            {0xE6, 0x7B, 0x01, 0xE6, 0x51, 0x5C, 0xDE, 0x84, 0x62, 0x68, 0xFD, 0x47, 0x76, 0xF5, 0xED, 0xC2,
+             0x34, 0xC2, 0x88, 0xCC, 0x1A, 0x9A, 0x09, 0xF4, 0x9E, 0x0F, 0x33, 0xF0, 0x47, 0x97, 0x44, 0xB4,
+             0x56, 0x07, 0x66, 0xA7, 0xB3, 0xE6, 0x86, 0xDD, 0x7D, 0x9C, 0xB4, 0x7B, 0x2C, 0x00, 0x66, 0xD0,
+             0x28, 0x47, 0xC6, 0x76, 0xD3, 0xEC, 0xDF, 0xC6, 0xC5, 0x9F, 0xCA, 0x41, 0xE5, 0xDE, 0xDE, 0x7D,
+             0xFE, 0x2A, 0x44},
+            {0xCA, 0xB8, 0x56, 0xA3, 0x52, 0xEA, 0x93, 0x9C, 0x29, 0x54, 0x3D, 0xBF, 0x9B, 0xEF, 0xA6, 0x94,
+             0xEA, 0xAA, 0x6E, 0x4F, 0x39, 0x8D, 0xCD, 0xC2, 0x56, 0xB4, 0xA4, 0x98, 0x5F, 0xC5, 0xE2, 0x9B,
+             0x19, 0x95, 0x4F, 0xB3, 0x0E, 0x63, 0xC8, 0xC4, 0xC8, 0x36, 0x50, 0x05, 0x5B, 0x2A, 0x5D, 0x4A,
+             0x86, 0x3C, 0x01, 0xF0, 0xA2, 0x7F, 0x1D, 0x8D, 0x74, 0x5B, 0x11, 0x35, 0x90, 0xA4, 0x1D, 0xB0,
+             0xED, 0x56, 0x22, 0x07, 0x31, 0x0B, 0x75, 0x49, 0xD5, 0xEA, 0xD3, 0x44, 0x5E, 0x64, 0xDA, 0xD4,},
+        },
     };
 
     for (const auto& test : tests) {
 
         Algorithm algo;
-        Key key;
+        SymmetricKey key;
         if (!algo.open(log, test.algo, test.mode) || !key.load(log, algo, test.key)) {
             continue;
         }
 
+        const bool pad_final = test.plain.size() % algo.block_size(log) != 0;
+
         // One-pass encryption/decryption.
         ByteVector encrypted;
-        if (!key.set_iv(log, test.iv) || !key.encrypt(log, test.plain, encrypted)) {
+        if (!key.set_iv(log, test.iv) || !key.encrypt(log, test.plain, encrypted, pad_final)) {
             continue;
         }
         if (encrypted != test.cipher) {
             log.error("Encryption vector test failed, invalid encrypted data");
         }
+
         ByteVector decrypted;
-        if (!key.set_iv(log, test.iv) || !key.decrypt(log, encrypted, decrypted)) {
+        if (!key.set_iv(log, test.iv) || !key.decrypt(log, test.cipher, decrypted, pad_final)) {
             continue;
         }
         if (decrypted != test.plain) {
-            log.error("Decryption vector test failed, invalid encrypted data");
+            log.error("Decryption vector test failed, invalid decrypted data");
+        }
+
+        // Multi-pass encryption/decryption, 2 blocks at a time.
+        const size_t chunk_size = 2 * algo.block_size(log);
+        const uint8_t* const plain_end = test.plain.data() + test.plain.size();
+        const uint8_t* const cipher_end = test.cipher.data() + test.cipher.size();
+
+        encrypted.clear();
+        if (!key.set_iv(log, test.iv)) {
+            continue;
+        }
+        for (const uint8_t* start = test.plain.data(); start < plain_end; start += chunk_size) {
+            const size_t size = std::min<size_t>(chunk_size, plain_end - start);
+            if (!key.encrypt(log, start, size, encrypted, pad_final && start + size == plain_end)) {
+                break;
+            }
+        }
+        if (encrypted != test.cipher) {
+            log.error("Encryption vector test failed, invalid encrypted data (multiple chunks)");
+        }
+
+        decrypted.clear();
+        if (!key.set_iv(log, test.iv)) {
+            continue;
+        }
+        for (const uint8_t* start = test.cipher.data(); start < cipher_end; start += chunk_size) {
+            const size_t size = std::min<size_t>(chunk_size, cipher_end - start);
+            if (!key.decrypt(log, start, size, decrypted, pad_final && start + size == cipher_end)) {
+                break;
+            }
+        }
+        if (decrypted != test.plain) {
+            log.error("Decryption vector test failed, invalid decrypted data (multiple chunks)");
+        }
+    }
+}
+
+//----------------------------------------------------------------------------
+// Run test vectors for GCM chaining mode.
+//----------------------------------------------------------------------------
+
+void test_gcm(Log& log)
+{
+    struct test_vector {
+        ByteVector key;      // AES key
+        ByteVector iv;       // 12 bytes
+        ByteVector auth;     // AAD, additional authentication data
+        ByteVector plain;    // any size (GCM is a stream cipher)
+        ByteVector cipher;   // same size as plain
+        ByteVector tag;      // output authentication tag
+    };
+
+    // Selected test vectors from the GCM specifications at NIST.
+    // https://csrc.nist.rip/groups/ST/toolkit/BCM/documents/proposedmodes/gcm/gcm-spec.pdf
+    // Use only test cases with AES key length = 128 or 256 and IV length = 96.
+    static const std::vector<test_vector> tests{
+        {  // Test Case 2
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {},
+            {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+            {0x03, 0x88, 0xDA, 0xCE, 0x60, 0xB6, 0xA3, 0x92, 0xF3, 0x28, 0xC2, 0xB9, 0x71, 0xB2, 0xFE, 0x78},
+            {0xAB, 0x6E, 0x47, 0xD4, 0x2C, 0xEC, 0x13, 0xBD, 0xF5, 0x3A, 0x67, 0xB2, 0x12, 0x57, 0xBD, 0xDF},
+        },
+        {  // Test Case 3
+            {0xFE, 0xFF, 0xE9, 0x92, 0x86, 0x65, 0x73, 0x1C, 0x6D, 0x6A, 0x8F, 0x94, 0x67, 0x30, 0x83, 0x08},
+            {0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xCE, 0xDB, 0xAD, 0xDE, 0xCA, 0xF8, 0x88},
+            {},
+            {0xD9, 0x31, 0x32, 0x25, 0xF8, 0x84, 0x06, 0xE5, 0xA5, 0x59, 0x09, 0xC5, 0xAF, 0xF5, 0x26, 0x9A,
+             0x86, 0xA7, 0xA9, 0x53, 0x15, 0x34, 0xF7, 0xDA, 0x2E, 0x4C, 0x30, 0x3D, 0x8A, 0x31, 0x8A, 0x72,
+             0x1C, 0x3C, 0x0C, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2F, 0xCF, 0x0E, 0x24, 0x49, 0xA6, 0xB5, 0x25,
+             0xB1, 0x6A, 0xED, 0xF5, 0xAA, 0x0D, 0xE6, 0x57, 0xBA, 0x63, 0x7B, 0x39, 0x1A, 0xAF, 0xD2, 0x55},
+            {0x42, 0x83, 0x1E, 0xC2, 0x21, 0x77, 0x74, 0x24, 0x4B, 0x72, 0x21, 0xB7, 0x84, 0xD0, 0xD4, 0x9C,
+             0xE3, 0xAA, 0x21, 0x2F, 0x2C, 0x02, 0xA4, 0xE0, 0x35, 0xC1, 0x7E, 0x23, 0x29, 0xAC, 0xA1, 0x2E,
+             0x21, 0xD5, 0x14, 0xB2, 0x54, 0x66, 0x93, 0x1C, 0x7D, 0x8F, 0x6A, 0x5A, 0xAC, 0x84, 0xAA, 0x05,
+             0x1B, 0xA3, 0x0B, 0x39, 0x6A, 0x0A, 0xAC, 0x97, 0x3D, 0x58, 0xE0, 0x91, 0x47, 0x3F, 0x59, 0x85},
+            {0x4D, 0x5C, 0x2A, 0xF3, 0x27, 0xCD, 0x64, 0xA6, 0x2C, 0xF3, 0x5A, 0xBD, 0x2B, 0xA6, 0xFA, 0xB4},
+        },
+        {  // Test Case 4
+            {0xFE, 0xFF, 0xE9, 0x92, 0x86, 0x65, 0x73, 0x1C, 0x6D, 0x6A, 0x8F, 0x94, 0x67, 0x30, 0x83, 0x08},
+            {0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xCE, 0xDB, 0xAD, 0xDE, 0xCA, 0xF8, 0x88},
+            {0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+             0xAB, 0xAD, 0xDA, 0xD2},
+            {0xD9, 0x31, 0x32, 0x25, 0xF8, 0x84, 0x06, 0xE5, 0xA5, 0x59, 0x09, 0xC5, 0xAF, 0xF5, 0x26, 0x9A,
+             0x86, 0xA7, 0xA9, 0x53, 0x15, 0x34, 0xF7, 0xDA, 0x2E, 0x4C, 0x30, 0x3D, 0x8A, 0x31, 0x8A, 0x72,
+             0x1C, 0x3C, 0x0C, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2F, 0xCF, 0x0E, 0x24, 0x49, 0xA6, 0xB5, 0x25,
+             0xB1, 0x6A, 0xED, 0xF5, 0xAA, 0x0D, 0xE6, 0x57, 0xBA, 0x63, 0x7B, 0x39},
+            {0x42, 0x83, 0x1E, 0xC2, 0x21, 0x77, 0x74, 0x24, 0x4B, 0x72, 0x21, 0xB7, 0x84, 0xD0, 0xD4, 0x9C,
+             0xE3, 0xAA, 0x21, 0x2F, 0x2C, 0x02, 0xA4, 0xE0, 0x35, 0xC1, 0x7E, 0x23, 0x29, 0xAC, 0xA1, 0x2E,
+             0x21, 0xD5, 0x14, 0xB2, 0x54, 0x66, 0x93, 0x1C, 0x7D, 0x8F, 0x6A, 0x5A, 0xAC, 0x84, 0xAA, 0x05,
+             0x1B, 0xA3, 0x0B, 0x39, 0x6A, 0x0A, 0xAC, 0x97, 0x3D, 0x58, 0xE0, 0x91},
+            {0x5B, 0xC9, 0x4F, 0xBC, 0x32, 0x21, 0xA5, 0xDB, 0x94, 0xFA, 0xE9, 0x5A, 0xE7, 0x12, 0x1A, 0x47},
+        },
+        {  // Test Case 16
+            {0xFE, 0xFF, 0xE9, 0x92, 0x86, 0x65, 0x73, 0x1C, 0x6D, 0x6A, 0x8F, 0x94, 0x67, 0x30, 0x83, 0x08,
+             0xFE, 0xFF, 0xE9, 0x92, 0x86, 0x65, 0x73, 0x1C, 0x6D, 0x6A, 0x8F, 0x94, 0x67, 0x30, 0x83, 0x08},
+            {0xCA, 0xFE, 0xBA, 0xBE, 0xFA, 0xCE, 0xDB, 0xAD, 0xDE, 0xCA, 0xF8, 0x88},
+            {0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED, 0xFA, 0xCE, 0xDE, 0xAD, 0xBE, 0xEF,
+             0xAB, 0xAD, 0xDA, 0xD2},
+            {0xD9, 0x31, 0x32, 0x25, 0xF8, 0x84, 0x06, 0xE5, 0xA5, 0x59, 0x09, 0xC5, 0xAF, 0xF5, 0x26, 0x9A,
+             0x86, 0xA7, 0xA9, 0x53, 0x15, 0x34, 0xF7, 0xDA, 0x2E, 0x4C, 0x30, 0x3D, 0x8A, 0x31, 0x8A, 0x72,
+             0x1C, 0x3C, 0x0C, 0x95, 0x95, 0x68, 0x09, 0x53, 0x2F, 0xCF, 0x0E, 0x24, 0x49, 0xA6, 0xB5, 0x25,
+             0xB1, 0x6A, 0xED, 0xF5, 0xAA, 0x0D, 0xE6, 0x57, 0xBA, 0x63, 0x7B, 0x39},
+            {0x52, 0x2D, 0xC1, 0xF0, 0x99, 0x56, 0x7D, 0x07, 0xF4, 0x7F, 0x37, 0xA3, 0x2A, 0x84, 0x42, 0x7D,
+             0x64, 0x3A, 0x8C, 0xDC, 0xBF, 0xE5, 0xC0, 0xC9, 0x75, 0x98, 0xA2, 0xBD, 0x25, 0x55, 0xD1, 0xAA,
+             0x8C, 0xB0, 0x8E, 0x48, 0x59, 0x0D, 0xBB, 0x3D, 0xA7, 0xB0, 0x8B, 0x10, 0x56, 0x82, 0x88, 0x38,
+             0xC5, 0xF6, 0x1E, 0x63, 0x93, 0xBA, 0x7A, 0x0A, 0xBC, 0xC9, 0xF6, 0x62},
+            {0x76, 0xFC, 0x6E, 0xCE, 0x0F, 0x4E, 0x17, 0x68, 0xCD, 0xDF, 0x88, 0x53, 0xBB, 0x2D, 0x55, 0x1B},
+        },
+    };
+
+    // All test vectors use AES-GCM.
+    Algorithm algo;
+    if (!algo.open(log, BCRYPT_AES_ALGORITHM, BCRYPT_CHAIN_MODE_GCM)) {
+        return;
+    }
+
+    for (const auto& test : tests) {
+        GCM key;
+        if (!key.load(log, algo, test.key)) {
+            continue;
+        }
+
+        // Multi-pass encryption/decryption, 2 blocks at a time.
+        const size_t chunk_size = 2 * algo.block_size(log);
+        const uint8_t* const plain_end = test.plain.data() + test.plain.size();
+        const uint8_t* const cipher_end = test.cipher.data() + test.cipher.size();
+
+        ByteVector encrypted;
+        ByteVector tag;
+        if (!key.set_iv(log, test.iv, test.auth)) {
+            continue;
+        }
+        bool success = true;
+        for (const uint8_t* start = test.plain.data(); success && start < plain_end; start += chunk_size) {
+            const size_t size = std::min<size_t>(chunk_size, plain_end - start);
+            if (start + size < plain_end) {
+                success = key.encrypt(log, start, size, encrypted);
+            }
+            else {
+                success = key.encrypt_final(log, start, size, encrypted, tag);
+            }
+        }
+        if (!success) {
+            continue;
+        }
+        if (encrypted != test.cipher) {
+            log.error("AES-GCM encryption vector test failed, invalid encrypted data");
+        }
+        if (tag != test.tag) {
+            log.error("AES-GCM encryption vector test failed, invalid authentication tag");
+        }
+
+        ByteVector decrypted;
+        if (!key.set_iv(log, test.iv, test.auth)) {
+            continue;
+        }
+        success = true;
+        for (const uint8_t* start = test.cipher.data(); success && start < cipher_end; start += chunk_size) {
+            const size_t size = std::min<size_t>(chunk_size, cipher_end - start);
+            if (start + size < cipher_end) {
+                success = key.decrypt(log, start, size, decrypted);
+            }
+            else {
+                success = key.decrypt_final(log, start, size, decrypted, test.tag);
+            }
+        }
+        if (decrypted != test.plain) {
+            log.error("AES-GCM decryption vector test failed, invalid decrypted data");
         }
     }
 }
@@ -795,9 +1016,8 @@ void test_ecb_cbc(Log& log)
 int main(int argc, char* argv[])
 {
     Log log(argc, argv);
-
     test_pbkdf2(log);
     test_ecb_cbc(log);
-
+    test_gcm(log);
     return log.exit_code();
 }

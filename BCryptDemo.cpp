@@ -168,7 +168,6 @@ class GCM : public SymmetricKey
 {
 public:
     // Set the initialization vector for the next chain of operations.
-    // The IV size must be GCM_IV_SIZE on Windows.
     // The additional authentication data (aad) are optional.
     // Must be called before a chain of encrypt or decrypt.
     bool set_iv(Log& log, const ByteVector& iv, const ByteVector& aad = ByteVector());
